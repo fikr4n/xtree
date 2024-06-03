@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+
+class parser:
+    @staticmethod
+    def parse_lines(lines, item_factory):
+        """
+        lines -- the iterable line strings
+        item_factory -- a callable(line_str_or_none, indent) -> new_item
+            where new_item is an object whose attribute indent and method
+            append_child(item)
+        """
+        root = item_factory(None, -1)
+        parent_stack = [root]
+        prev_item = None
+        for item in parser.yield_lines_flat(lines, item_factory):
+            while item.indent <= parent_stack[-1].indent: # Level out
+                parent_stack.pop()
+            if prev_item and item.indent > prev_item.indent: # Level in
+                parent_stack.append(prev_item)
+            parent_stack[-1].append_child(item)
+            prev_item = item
+        return root
+
+    @staticmethod
+    def yield_lines_flat(lines, item_factory):
+        last_indent = 0
+        for line in lines:
+            indent = parser.find_indent(line)
+            if indent == len(line) and indent < last_indent: # Prevent breaking
+                indent = last_indent
+            last_indent = indent
+            yield item_factory(line, indent)
+
+    @staticmethod
+    def find_indent(s):
+        for i in range(len(s)):
+            if s[i].isalnum(): return i
+        return len(s)
+
+class reader:
+    @staticmethod
+    def yield_lines(textio):
+        for l in textio: yield l.rstrip('\n')
+
+import sys
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk
+
+class Application(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="fikr4n.xtree.py")
+        GLib.set_application_name("Xtree")
+
+    def do_activate(self):
+        self.store = Gtk.TreeStore(str)
+        tree = Gtk.TreeView(model=self.store, headers_visible=False)
+        tree.append_column(Gtk.TreeViewColumn(cell_renderer=Gtk.CellRendererText()))
+        tree.append_column(
+            Gtk.TreeViewColumn(
+                "Line",
+                cell_renderer=Gtk.CellRendererText(family="mono"),
+                text=0,
+            )
+        )
+        scrolled_window = Gtk.ScrolledWindow(child=tree)
+        window = Gtk.ApplicationWindow(
+            application=self,
+            title="Xtree",
+            child=scrolled_window,
+            default_width=800, default_height=600,
+        )
+        window.present()
+        
+        parser.parse_lines(reader.yield_lines(sys.stdin), self.new_item)
+
+    def new_item(self, line, indent):
+        return TreeIterItem(self.store, line, indent)
+
+class TreeIterItem:
+    def __init__(self, store, line, indent):
+        self.store = store
+        self.line = line
+        self.indent = indent
+        self.tree_iter = None
+    
+    def append_child(self, item):
+        it = self.store.append(self.tree_iter, [item.line])
+        item.tree_iter = it
+
+app = Application()
+exit_status = app.run(sys.argv)
+sys.exit(exit_status)
+
