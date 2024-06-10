@@ -43,6 +43,8 @@ class reader:
         for l in textio: yield l.rstrip('\n')
 
 import sys
+import threading
+import queue
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk
@@ -54,8 +56,16 @@ class Application(Gtk.Application):
 
     def do_activate(self):
         self.store = Gtk.TreeStore(str)
-        tree = Gtk.TreeView(model=self.store, headers_visible=False)
-        tree.append_column(Gtk.TreeViewColumn(cell_renderer=Gtk.CellRendererText()))
+        self.filter_func = MemoizedFilterFunc()
+        self.filter = self.store.filter_new()
+        self.filter.set_visible_func(self.filter_func)
+        tree = Gtk.TreeView(
+            model=self.filter,
+            headers_visible=False, vexpand=True,
+        )
+        tree.append_column(
+            Gtk.TreeViewColumn(cell_renderer=Gtk.CellRendererText())
+        )
         tree.append_column(
             Gtk.TreeViewColumn(
                 "Line",
@@ -63,30 +73,140 @@ class Application(Gtk.Application):
                 text=0,
             )
         )
+        tree.connect("row-activated", self.on_tree_row_activated)
         scrolled_window = Gtk.ScrolledWindow(child=tree)
+        
+        self.filter_entry = Gtk.Entry(
+            hexpand=True,
+            secondary_icon_name="edit-clear-all",
+            secondary_icon_tooltip_text="Clear",
+        )
+        self.filter_entry.connect("activate", self.on_filter)
+        self.filter_entry.connect("icon-release", self.on_filter_clear)
+        filter_label = Gtk.Label(
+            label="_Filter:", use_underline=True,
+            mnemonic_widget=self.filter_entry,
+        )
+        expand_button = Gtk.Button(
+            icon_name="view-fullscreen-symbolic",
+            tooltip_text="Expand All",
+        )
+        expand_button.connect("clicked", lambda _: tree.expand_all())
+        collapse_button = Gtk.Button(
+            icon_name="view-restore-symbolic",
+            tooltip_text="Collapse All",
+        )
+        collapse_button.connect("clicked", lambda _: tree.collapse_all())
+        box11 = Gtk.Box(
+            margin_start=8, margin_top=8, margin_end=8, margin_bottom=8,
+            spacing=8,
+        )
+        box11.append(expand_button)
+        box11.append(collapse_button)
+        box11.append(filter_label)
+        box11.append(self.filter_entry)
+        
+        box1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box1.append(scrolled_window)
+        box1.append(box11)
         window = Gtk.ApplicationWindow(
             application=self,
             title="Xtree",
-            child=scrolled_window,
+            child=box1,
             default_width=800, default_height=600,
         )
         window.present()
         
+        StoreAppendingScheduler(self.store).start()
+
+    def on_tree_row_activated(self, tree, path, column):
+        if tree.row_expanded(path): tree.collapse_row(path)
+        else: tree.expand_row(path, True)
+
+    def on_filter(self, *_):
+        self.filter_func.filter_value = self.filter_entry.get_text()
+        self.filter.refilter()
+    
+    def on_filter_clear(self, *_):
+        self.filter_entry.set_text("")
+        self.on_filter()
+
+class MemoizedFilterFunc:
+    def __init__(self):
+        self.filter_value = ""
+        self.memo = (None, {})
+        
+    def __call__(self, model, iter, data):
+        v = self.filter_value
+        try:
+            if self.memo[0] == v: return self.memo[1][iter]
+        except KeyError:
+            pass
+        if v in model[iter][0]:
+            return self.memoize(v, iter, True)
+        else:
+            child = model.iter_children(iter)
+            while child:
+                m = self(model, child, None)
+                if m: return self.memoize(v, iter, True)
+                child = model.iter_next(child)
+            return self.memoize(v, iter, False)
+
+    def memoize(self, memo_key, iter, matches):
+        if (self.memo[0] != memo_key): self.memo = (memo_key, {})
+        self.memo[1][iter] = matches
+        return matches
+
+class StoreAppendingScheduler:
+    close_token = object()
+    
+    def __init__(self, store):
+        self.store = store
+        self.queue = queue.Queue()
+    
+    def start(self):
+        threading.Thread(target=self.execute, daemon=True).start()
+        GLib.timeout_add(100, self.consume)
+        
+    def execute(self):
         parser.parse_lines(reader.yield_lines(sys.stdin), self.new_item)
+        self.enqueue(self.close_token)
 
     def new_item(self, line, indent):
-        return TreeIterItem(self.store, line, indent)
-
-class TreeIterItem:
-    def __init__(self, store, line, indent):
-        self.store = store
-        self.line = line
-        self.indent = indent
-        self.tree_iter = None
+        return self.Item(self, line, indent)
     
-    def append_child(self, item):
-        it = self.store.append(self.tree_iter, [item.line])
-        item.tree_iter = it
+    def enqueue(self, task):
+        self.queue.put(task)
+    
+    def consume(self):
+        closed = False
+        count = 0
+        with self.store.freeze_notify():
+            try:
+                while True:
+                    task = self.queue.get_nowait()
+                    if task is self.close_token:
+                        closed = True
+                        break
+                    task()
+                    count += 1
+            except queue.Empty:
+                pass
+        return GLib.SOURCE_REMOVE if closed else GLib.SOURCE_CONTINUE
+
+    class Item:
+        def __init__(self, outer, line: str, indent: int):
+            self.outer = outer
+            self.line = line
+            self.indent = indent
+            self.tree_iter = None
+        
+        def append_child(self, item):
+            self.outer.enqueue(lambda: self.append_child_now(item))
+        
+        def append_child_now(self, item):
+            it = self.outer.store.append(self.tree_iter, [item.line])
+            item.tree_iter = it
 
 app = Application()
 exit_status = app.run(sys.argv)
