@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 
-class parser:
-    @staticmethod
-    def parse_lines(lines, item_factory):
+import re
+
+class Parser:
+    indent_patterns = {
+        "default": r"^[-+*|/\\─│├└ ]*",
+        "ascii": r"^[-+*|/\\ ]*",
+        "box-drawings": r"^[─│├└ ]*",
+        "whitespace": r"^\s*",
+        "non-alnum": r"^\W*",
+    }
+    indent_types = indent_patterns.keys()
+    
+    def __init__(self, indent_type):
+        self.indent_pattern = re.compile(self.indent_patterns[indent_type])
+    
+    def parse_lines(self, lines, item_factory):
         """
         lines -- the iterable line strings
         item_factory -- a callable(line_str_or_none, indent) -> new_item
@@ -12,7 +25,7 @@ class parser:
         root = item_factory(None, -1)
         parent_stack = [root]
         prev_item = None
-        for item in parser.yield_lines_flat(lines, item_factory):
+        for item in self.yield_lines_flat(lines, item_factory):
             while item.indent <= parent_stack[-1].indent: # Level out
                 parent_stack.pop()
             if prev_item and item.indent > prev_item.indent: # Level in
@@ -21,194 +34,233 @@ class parser:
             prev_item = item
         return root
 
-    @staticmethod
-    def yield_lines_flat(lines, item_factory):
+    def yield_lines_flat(self, lines, item_factory):
         last_indent = 0
         for line in lines:
-            indent = parser.find_indent(line)
+            indent = self.find_indent(line)
             if indent == len(line) and indent < last_indent: # Prevent breaking
                 indent = last_indent
             last_indent = indent
             yield item_factory(line, indent)
 
-    @staticmethod
-    def find_indent(s):
-        for i in range(len(s)):
-            if s[i].isalnum(): return i
-        return len(s)
+    def find_indent(self, s):
+        m = self.indent_pattern.match(s)
+        return m.end()
 
 class reader:
     @staticmethod
     def yield_lines(textio):
         for l in textio: yield l.rstrip('\n')
 
-import sys
-import threading
-import queue
 import gi
+gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
-from gi.repository import GLib, Gtk
+from gi.repository import GObject, GLib, Gio, Gdk, Gtk
+
+def gobject_getattr(self, name):
+    try: return self.get_property(name)
+    except TypeError as e: raise AttributeError(e)
+
+def gobject_setattr(self, name, value):
+    if name not in dir(self.props) or name in dir(self):
+        old_gobject_setattr(self, name, value)
+    else: self.set_property(name, value)
+
+GObject.Object.__getattr__ = gobject_getattr
+old_gobject_setattr = GObject.Object.__setattr__
+GObject.Object.__setattr__ = gobject_setattr
+
+class Item(GObject.Object):
+    line = GObject.Property(type=str)
+    indent = GObject.Property(type=int)
+    
+    def __init__(self, line: str, indent: int):
+        super().__init__()
+        self.line = line
+        self.indent = indent
+        self.children = []
+    
+    def append_child(self, item: 'Item'):
+        self.children.append(item)
 
 class Application(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="fikr4n.xtree.py")
+        super().__init__(application_id="fikr4n.Xtree.py")
         GLib.set_application_name("Xtree")
+        self.set_up_css()
+    
+    def set_up_css(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(b"""
+            .tiny-button {
+                min-width: 0px;
+                min-height: 0px;
+            }
+        """)
+        for d in Gdk.DisplayManager.get().list_displays():
+            Gtk.StyleContext.add_provider_for_display(
+                d, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
 
     def do_activate(self):
-        self.store = Gtk.TreeStore(str)
-        self.filter_func = MemoizedFilterFunc()
-        self.filter = self.store.filter_new()
-        self.filter.set_visible_func(self.filter_func)
-        tree = Gtk.TreeView(
-            model=self.filter,
-            headers_visible=False, vexpand=True,
-        )
-        tree.append_column(
-            Gtk.TreeViewColumn(cell_renderer=Gtk.CellRendererText())
-        )
-        tree.append_column(
-            Gtk.TreeViewColumn(
-                "Line",
-                cell_renderer=Gtk.CellRendererText(family="mono"),
-                text=0,
-            )
-        )
-        tree.connect("row-activated", self.on_tree_row_activated)
-        scrolled_window = Gtk.ScrolledWindow(child=tree)
-        
-        self.filter_entry = Gtk.Entry(
-            hexpand=True,
-            secondary_icon_name="edit-clear-all",
+        self.list_window = ListWindow()
+        filter_entry = Gtk.Entry(
+            placeholder_text="Filter",
+            secondary_icon_name="edit-clear-all-symbolic",
             secondary_icon_tooltip_text="Clear",
         )
-        self.filter_entry.connect("activate", self.on_filter)
-        self.filter_entry.connect("icon-release", self.on_filter_clear)
-        filter_label = Gtk.Label(
-            label="_Filter:", use_underline=True,
-            mnemonic_widget=self.filter_entry,
+        filter_entry.connect("changed", lambda editable:
+            self.list_window.filter.set_filter_value(editable.text)
         )
-        expand_button = Gtk.Button(
-            icon_name="view-fullscreen-symbolic",
-            tooltip_text="Expand All",
+        filter_entry.connect("icon_release", lambda entry, _:
+            entry.set_text("")
         )
-        expand_button.connect("clicked", lambda _: tree.expand_all())
-        collapse_button = Gtk.Button(
-            icon_name="view-restore-symbolic",
-            tooltip_text="Collapse All",
-        )
-        collapse_button.connect("clicked", lambda _: tree.collapse_all())
-        box11 = Gtk.Box(
-            margin_start=8, margin_top=8, margin_end=8, margin_bottom=8,
-            spacing=8,
-        )
-        box11.append(expand_button)
-        box11.append(collapse_button)
-        box11.append(filter_label)
-        box11.append(self.filter_entry)
         
         box1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        box1.append(scrolled_window)
-        box1.append(box11)
+        box1.append(self.list_window)
+        header_bar = Gtk.HeaderBar()
+        header_bar.pack_start(filter_entry)
         window = Gtk.ApplicationWindow(
             application=self,
-            title="Xtree",
+            title="Xtree – stdin",
+            titlebar=header_bar,
             child=box1,
             default_width=800, default_height=600,
         )
         window.present()
-        
-        StoreAppendingScheduler(self.store).start()
 
-    def on_tree_row_activated(self, tree, path, column):
-        if tree.row_expanded(path): tree.collapse_row(path)
-        else: tree.expand_row(path, True)
-
-    def on_filter(self, *_):
-        self.filter_func.filter_value = self.filter_entry.get_text()
-        self.filter.refilter()
+class ListWindow(Gtk.ScrolledWindow):
+    default_autoexpand = False
     
-    def on_filter_clear(self, *_):
-        self.filter_entry.set_text("")
-        self.on_filter()
-
-class MemoizedFilterFunc:
     def __init__(self):
+        super().__init__(vexpand=True)
+        
+        self.model = Gtk.TreeListModel.new(
+            self.create_list_store(root_item), False, self.default_autoexpand,
+            self.create_list_store,
+        )
+        self.filter = MemoizedFilter()
+        filter_model = Gtk.FilterListModel(
+            model=self.model, filter=self.filter, incremental=True,
+        )
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", lambda _, i: i.set_child(ItemView()))
+        factory.connect("bind", lambda _, i: i.child.bind_list_row(i.item))
+        factory.connect("unbind", lambda _, i: i.child.unbind_list_row(i.item))
+        list_view = Gtk.ListView(
+            model=Gtk.MultiSelection(model=filter_model),
+            factory=factory,
+        )
+        list_view.add_css_class("data-table")
+        list_view.connect("activate", self.on_activate)
+        self.child = list_view
+    
+    def create_list_store(self, item: 'Item'):
+        if item.children:
+            result = Gio.ListStore()
+            result.splice(0, 0, item.children)
+            return result
+    
+    def on_activate(self, view: Gtk.ListView, position):
+        r = view.model.get_item(position)
+        self.model.autoexpand = True
+        r.expanded = not r.expanded
+        self.model.autoexpand = self.default_autoexpand
+
+class ItemView(Gtk.Box):
+    def __init__(self):
+        super().__init__()
+        expander = Gtk.Button()
+        expander.add_css_class("flat")
+        expander.add_css_class("circular")
+        expander.add_css_class("tiny-button")
+        expander.connect("clicked", lambda _: self.toggle_expanded())
+        label = Gtk.Label()
+        label.add_css_class("monospace")
+        self.append(expander)
+        self.append(Gtk.Separator(margin_end=4, vexpand=True))
+        self.append(label)
+        self.expander = expander
+        self.label = label
+    
+    def toggle_expanded(self):
+        self.list_row.expanded = not self.list_row.expanded
+    
+    def bind_list_row(self, row: Gtk.TreeListRow):
+        self.list_row = row
+        self.label.label = row.item.line
+        self.on_list_row_updated()
+        
+        row.item_view_shid = row.connect("notify::expanded",
+            self.on_list_row_updated)
+    
+    def on_list_row_updated(self, *_):
+        r = self.list_row
+        x = self.expander
+        x.sensitive = r.expandable
+        if not r.expandable: x.icon_name = ""
+        elif r.expanded: x.icon_name = "pan-down-symbolic"
+        else: x.icon_name = "pan-end-symbolic"
+    
+    def unbind_list_row(self, row: Gtk.TreeListRow):
+        if row is not self.list_row: raise ValueError()
+        row.disconnect(row.item_view_shid)
+        
+        del self.list_row
+
+class MemoizedFilter(Gtk.Filter):
+    def __init__(self):
+        super().__init__()
         self.filter_value = ""
         self.memo = (None, {})
         
-    def __call__(self, model, iter, data):
+    def set_filter_value(self, value: str):
+        old_value = self.filter_value
+        c = Gtk.FilterChange.DIFFERENT
+        if old_value in value: c = Gtk.FilterChange.MORE_STRICT
+        elif value in old_value: c = Gtk.FilterChange.LESS_STRICT
+        self.filter_value = value
+        self.changed(c)
+        
+    def do_match(self, row: Gtk.TreeListRow):
+        return self.item_match(row.item)
+    
+    def item_match(self, item: 'Item'):
         v = self.filter_value
         try:
-            if self.memo[0] == v: return self.memo[1][iter]
+            if self.memo[0] == v: return self.memo[1][item]
         except KeyError:
             pass
-        if v in model[iter][0]:
-            return self.memoize(v, iter, True)
+        if v in item.line:
+            return self.memoize(v, item, True)
         else:
-            child = model.iter_children(iter)
-            while child:
-                m = self(model, child, None)
-                if m: return self.memoize(v, iter, True)
-                child = model.iter_next(child)
-            return self.memoize(v, iter, False)
+            for child_item in item.children:
+                m = self.item_match(child_item)
+                if m: return self.memoize(v, item, True)
+            return self.memoize(v, item, False)
 
-    def memoize(self, memo_key, iter, matches):
+    def memoize(self, memo_key: str, item: 'Item', matches: bool):
         if (self.memo[0] != memo_key): self.memo = (memo_key, {})
-        self.memo[1][iter] = matches
+        self.memo[1][item] = matches
         return matches
 
-class StoreAppendingScheduler:
-    close_token = object()
-    
-    def __init__(self, store):
-        self.store = store
-        self.queue = queue.Queue()
-    
-    def start(self):
-        threading.Thread(target=self.execute, daemon=True).start()
-        GLib.timeout_add(100, self.consume)
-        
-    def execute(self):
-        parser.parse_lines(reader.yield_lines(sys.stdin), self.new_item)
-        self.enqueue(self.close_token)
+import sys
+import argparse
 
-    def new_item(self, line, indent):
-        return self.Item(self, line, indent)
-    
-    def enqueue(self, task):
-        self.queue.put(task)
-    
-    def consume(self):
-        closed = False
-        count = 0
-        with self.store.freeze_notify():
-            try:
-                while True:
-                    task = self.queue.get_nowait()
-                    if task is self.close_token:
-                        closed = True
-                        break
-                    task()
-                    count += 1
-            except queue.Empty:
-                pass
-        return GLib.SOURCE_REMOVE if closed else GLib.SOURCE_CONTINUE
+def parse_args():
+    p = argparse.ArgumentParser(description="Display text as expandable tree")
+    p.add_argument("-i", "--indent-type",
+        choices=Parser.indent_types,
+        default=next(iter(Parser.indent_types)),
+        help="type of indentation or characters pattern of the indentation part",
+    )
+    return p.parse_args()
 
-    class Item:
-        def __init__(self, outer, line: str, indent: int):
-            self.outer = outer
-            self.line = line
-            self.indent = indent
-            self.tree_iter = None
-        
-        def append_child(self, item):
-            self.outer.enqueue(lambda: self.append_child_now(item))
-        
-        def append_child_now(self, item):
-            it = self.outer.store.append(self.tree_iter, [item.line])
-            item.tree_iter = it
+args = parse_args()
 
-app = Application()
-exit_status = app.run(sys.argv)
+parser = Parser(args.indent_type)
+root_item = parser.parse_lines(reader.yield_lines(sys.stdin), Item)
+
+exit_status = Application().run([])
 sys.exit(exit_status)
 
