@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 
+# Run `./xtree -h` for info.
+# ⓒ fikr4n, 2024
+
+###############################################################################
+# Backend
+###############################################################################
+
 import re
 
 class Parser:
@@ -52,25 +59,32 @@ class reader:
     def yield_lines(textio):
         for l in textio: yield l.rstrip('\n')
 
+###############################################################################
+# Frontend (GUI)
+###############################################################################
+
 import gi
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import GObject, GLib, Gio, Gdk, Gtk
 
+# To support direct/convenience usage of GObject properties.
 def gobject_getattr(self, name):
     try: return self.get_property(name)
     except TypeError as e: raise AttributeError(e)
-
 def gobject_setattr(self, name, value):
     if name not in dir(self.props) or name in dir(self):
         old_gobject_setattr(self, name, value)
     else: self.set_property(name, value)
-
 GObject.Object.__getattr__ = gobject_getattr
 old_gobject_setattr = GObject.Object.__setattr__
 GObject.Object.__setattr__ = gobject_setattr
 
 class Item(GObject.Object):
+    """
+    Data model representing an item/line in the list.
+    """
+
     line = GObject.Property(type=str)
     indent = GObject.Property(type=int)
     
@@ -243,6 +257,10 @@ class MemoizedFilter(Gtk.Filter):
         if (self.memo[0] != memo_key): self.memo = (memo_key, {})
         self.memo[1][item] = matches
         return matches
+
+###############################################################################
+# Frontend (launcher and CLI)
+###############################################################################
 
 import sys
 import argparse
