@@ -2,6 +2,10 @@
 
 Display text as expandable tree
 
+<p align="center">
+  <img src="docs/screenshot.webp" alt="Screenshot" width="414"/>
+</p>
+
 I created this to make it easier (for human) to read tree-like output of a
 program, such as `gradle`, `lshw`, and `lsblk`, by displaying it along with
 expand-collapse buttons.
